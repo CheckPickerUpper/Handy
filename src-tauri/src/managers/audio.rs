@@ -4,8 +4,9 @@ use crate::audio_toolkit::{
         SmoothedVad, VAD_OFFLINE_HANGOVER_FRAMES, VAD_ONSET_FRAMES, VAD_PREFILL_FRAMES,
         VAD_STREAMING_HANGOVER_FRAMES,
     },
-    AudioRecorder, SileroVad, VadPolicy,
+    AudioRecorder, SileroVad, VadPolicy, MICROPHONE_READY_TIMEOUT,
 };
+use crate::capture_events::{RecordingErrorEvent, RecordingWarningEvent, MICROPHONE_STALLED_ERROR};
 use crate::helpers::clamshell;
 use crate::managers::transcription::StreamRouter;
 use crate::settings::{get_settings, write_settings, AppSettings};
@@ -19,6 +20,29 @@ use tauri::{Emitter, Manager};
 
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const VAD_THRESHOLD: f32 = 0.3;
+
+fn accepts_capture_callback(accepted_generation: &AtomicU64, generation: u64) -> bool {
+    accepted_generation.load(Ordering::Acquire) == generation
+}
+
+fn claim_capture_generation(
+    current_generation: &AtomicU64,
+    recording_active: &AtomicBool,
+    latch: &AtomicU64,
+    generation: u64,
+    allow_inactive: bool,
+) -> bool {
+    if current_generation.load(Ordering::Acquire) != generation
+        || (!allow_inactive && !recording_active.load(Ordering::Acquire))
+    {
+        return false;
+    }
+
+    let previous = latch.fetch_max(generation, Ordering::AcqRel);
+    previous < generation
+        && current_generation.load(Ordering::Acquire) == generation
+        && (allow_inactive || recording_active.load(Ordering::Acquire))
+}
 
 fn set_mute(mute: bool) {
     // Expected behavior:
@@ -282,6 +306,7 @@ fn create_audio_recorder(
     app_handle: &tauri::AppHandle,
     selected_channel: Option<u16>,
     stream_router: Arc<StreamRouter>,
+    accepted_callback_generation: Arc<AtomicU64>,
 ) -> Result<AudioRecorder, anyhow::Error> {
     // A single Silero engine covers both the offline and streaming policies (never
     // active at once within a recording), so the recorder reconfigures its
@@ -308,14 +333,45 @@ fn create_audio_recorder(
         .with_selected_channel(selected_channel)
         .with_level_callback({
             let app_handle = app_handle.clone();
-            move |levels| {
-                utils::emit_levels(&app_handle, &levels);
+            let accepted_generation = Arc::clone(&accepted_callback_generation);
+            move |generation, levels| {
+                if accepts_capture_callback(&accepted_generation, generation) {
+                    utils::emit_levels(&app_handle, &levels);
+                }
             }
         })
         .with_audio_callback({
             let router = stream_router;
-            move |frame| {
-                router.feed(frame);
+            let accepted_generation = accepted_callback_generation;
+            move |generation, frame| {
+                if accepts_capture_callback(&accepted_generation, generation) {
+                    router.feed(frame);
+                }
+            }
+        })
+        .with_capture_error_callback({
+            let app_handle = app_handle.clone();
+            move |generation, detail| {
+                let manager = app_handle.state::<Arc<AudioRecordingManager>>();
+                if accepts_capture_callback(&manager.accepted_callback_generation, generation) {
+                    manager.report_capture_failure(
+                        generation,
+                        "recorder_watchdog",
+                        MICROPHONE_STALLED_ERROR,
+                        None,
+                        detail,
+                        false,
+                    );
+                }
+            }
+        })
+        .with_capture_warning_callback({
+            let app_handle = app_handle.clone();
+            move |generation, dropped_samples| {
+                let manager = app_handle.state::<Arc<AudioRecordingManager>>();
+                if accepts_capture_callback(&manager.accepted_callback_generation, generation) {
+                    manager.report_capture_warning(generation, dropped_samples);
+                }
             }
         });
 
@@ -326,14 +382,24 @@ fn create_audio_recorder(
 
 /// One recording session's first-sample notification. Waiting on this never
 /// blocks the shortcut coordinator: callers hand it to a dedicated worker.
+pub enum RecordingReadinessResult {
+    Ready,
+    Disconnected,
+    TimedOut,
+}
+
 pub struct RecordingReadiness {
     receiver: mpsc::Receiver<()>,
     generation: u64,
 }
 
 impl RecordingReadiness {
-    pub fn wait(self) -> bool {
-        self.receiver.recv().is_ok()
+    pub fn wait(self) -> RecordingReadinessResult {
+        match self.receiver.recv_timeout(MICROPHONE_READY_TIMEOUT) {
+            Ok(()) => RecordingReadinessResult::Ready,
+            Err(mpsc::RecvTimeoutError::Disconnected) => RecordingReadinessResult::Disconnected,
+            Err(mpsc::RecvTimeoutError::Timeout) => RecordingReadinessResult::TimedOut,
+        }
     }
 
     pub fn generation(&self) -> u64 {
@@ -366,6 +432,19 @@ pub struct AudioRecordingManager {
     /// stopped or cancelled. This prevents a slow device from producing a late
     /// "ready" indication for a session the user already ended.
     capture_generation: Arc<AtomicU64>,
+    /// Generation whose frames and visualization levels may reach downstream
+    /// consumers. Cleared after Stop and before detaching a worker so a zombie
+    /// cannot feed a newer streaming session.
+    accepted_callback_generation: Arc<AtomicU64>,
+    /// Generation still allowed to emit the asynchronous first-sample cue.
+    /// Set to zero as soon as Stop or cancellation begins without changing the
+    /// capture identity used to deduplicate terminal failures.
+    readiness_generation: Arc<AtomicU64>,
+    /// Highest capture generation for which terminal cleanup was claimed.
+    terminal_failure_generation: Arc<AtomicU64>,
+    /// Independent latch for the one nonfatal dropped-audio warning. A warning
+    /// must never suppress a later terminal failure for the same capture.
+    overrun_warning_generation: Arc<AtomicU64>,
     /// Resolution of a *named* microphone (selected or clamshell) to its cpal
     /// device, cached so on-demand recording starts skip the full device
     /// enumeration (~40-110ms). Keyed by the resolved name, so a settings
@@ -403,6 +482,10 @@ impl AudioRecordingManager {
             stream_router,
             recording_active: Arc::new(AtomicBool::new(false)),
             capture_generation: Arc::new(AtomicU64::new(0)),
+            accepted_callback_generation: Arc::new(AtomicU64::new(0)),
+            readiness_generation: Arc::new(AtomicU64::new(0)),
+            terminal_failure_generation: Arc::new(AtomicU64::new(0)),
+            overrun_warning_generation: Arc::new(AtomicU64::new(0)),
             cached_device: Arc::new(Mutex::new(None)),
         };
 
@@ -440,6 +523,106 @@ impl AudioRecordingManager {
 
     pub fn invalidate_device_cache(&self) {
         *self.cached_device.lock().unwrap() = None;
+    }
+
+    fn claim_generation(&self, latch: &AtomicU64, generation: u64, allow_inactive: bool) -> bool {
+        claim_capture_generation(
+            &self.capture_generation,
+            &self.recording_active,
+            latch,
+            generation,
+            allow_inactive,
+        )
+    }
+
+    fn report_capture_failure_inner(
+        &self,
+        generation: u64,
+        detector: &str,
+        error_type: &str,
+        event_detail: Option<String>,
+        log_detail: &str,
+        allow_inactive: bool,
+    ) {
+        if !self.claim_generation(
+            &self.terminal_failure_generation,
+            generation,
+            allow_inactive,
+        ) {
+            debug!(
+                "Ignoring duplicate or stale microphone failure from {detector} for capture generation {generation}"
+            );
+            return;
+        }
+
+        error!(
+            "Microphone failure claimed by {detector} for capture generation {generation}: {log_detail}"
+        );
+        let _ = self.app_handle.emit(
+            "recording-error",
+            RecordingErrorEvent::new(error_type, event_detail),
+        );
+
+        // Recorder callbacks run on the consumer thread. Always cancel from a
+        // separate worker so cleanup can never wait for or join itself.
+        let app = self.app_handle.clone();
+        std::thread::spawn(move || utils::cancel_current_operation(&app));
+    }
+
+    pub fn report_capture_failure(
+        &self,
+        generation: u64,
+        detector: &str,
+        error_type: &str,
+        event_detail: Option<String>,
+        log_detail: &str,
+        allow_inactive: bool,
+    ) {
+        self.report_capture_failure_inner(
+            generation,
+            detector,
+            error_type,
+            event_detail,
+            log_detail,
+            allow_inactive,
+        );
+    }
+
+    pub fn report_capture_warning(&self, generation: u64, dropped_samples: u64) {
+        if self.terminal_failure_generation.load(Ordering::Acquire) >= generation
+            || !self.claim_generation(&self.overrun_warning_generation, generation, false)
+            || self.terminal_failure_generation.load(Ordering::Acquire) >= generation
+        {
+            return;
+        }
+
+        debug!(
+            "Capture generation {generation} lost microphone samples; showing one nonfatal warning"
+        );
+        let _ = self.app_handle.emit(
+            "recording-warning",
+            RecordingWarningEvent::audio_dropped(dropped_samples),
+        );
+    }
+
+    /// Remove a recorder whose worker might still be alive. Dropping the owner
+    /// leaves any detached worker with the old VAD Arc; preload_vad() will build
+    /// an independent recorder and VAD for the next keypress.
+    fn quarantine_recorder(&self, reason: &str) {
+        warn!("Discarding unresponsive microphone recorder: {reason}");
+        // Invalidate frame/level forwarding before waiting for teardown. A
+        // detached worker that later resumes can no longer reach a live route.
+        self.accepted_callback_generation
+            .store(0, Ordering::Release);
+        // Preserve the manager's global lock order: is_open before recorder.
+        let mut open_flag = self.is_open.lock().unwrap();
+        let mut old_recorder = self.recorder.lock().unwrap().take();
+        if let Some(recorder) = old_recorder.as_mut() {
+            let _ = recorder.close();
+        }
+        *open_flag = false;
+        *self.is_recording.lock().unwrap() = false;
+        self.invalidate_device_cache();
     }
 
     fn resolve_microphone_device(&self, settings: &AppSettings) -> MicrophoneResolution {
@@ -608,6 +791,7 @@ impl AudioRecordingManager {
                 &self.app_handle,
                 settings.selected_channel,
                 Arc::clone(&self.stream_router),
+                Arc::clone(&self.accepted_callback_generation),
             )?);
         }
         Ok(())
@@ -646,8 +830,16 @@ impl AudioRecordingManager {
                     mute_guard.did_mute = false;
                 }
             }
-            if let Some(rec) = self.recorder.lock().unwrap().as_mut() {
-                let _ = rec.close();
+            {
+                let mut recorder_guard = self.recorder.lock().unwrap();
+                let replace = if let Some(recorder) = recorder_guard.as_mut() {
+                    recorder.close().is_err() || recorder.replacement_required()
+                } else {
+                    false
+                };
+                if replace {
+                    recorder_guard.take();
+                }
             }
             *self.is_recording.lock().unwrap() = false;
             *open_flag = false;
@@ -686,17 +878,59 @@ impl AudioRecordingManager {
         let vad_elapsed = vad_started.elapsed();
 
         let open_started = Instant::now();
-        let mut recorder_opt = self.recorder.lock().unwrap();
-        if let Some(rec) = recorder_opt.as_mut() {
-            if let Err(first_err) = rec.open(resolution.device.clone()) {
-                // A cached device or config may have gone stale (unplugged,
-                // rate/format changed). Re-resolve from a fresh enumeration and
-                // retry once before surfacing the error.
-                warn!("Recorder open failed ({first_err}); re-resolving device and retrying once");
+        let first_open = {
+            let mut recorder_guard = self.recorder.lock().unwrap();
+            recorder_guard
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Recorder not available"))?
+                .open(resolution.device.clone())
+        };
+        if let Err(first_err) = first_open {
+            let replace = self
+                .recorder
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(AudioRecorder::replacement_required);
+            if replace {
+                // A timed-out backend already consumed the full initialization
+                // budget. Detach it now and rebuild lazily on the next keypress
+                // rather than freezing cancellation for a second 12-second try.
+                let mut old = self.recorder.lock().unwrap().take();
+                if let Some(recorder) = old.as_mut() {
+                    let _ = recorder.close();
+                }
                 self.invalidate_device_cache();
-                resolution = self.resolve_microphone_device(&settings);
-                rec.open(resolution.device.clone())
-                    .map_err(|e| anyhow::anyhow!("Failed to open recorder: {}", e))?;
+                return Err(anyhow::anyhow!("Failed to open recorder: {}", first_err));
+            }
+
+            // Ordinary failures can still be a stale cached device or config.
+            // Re-resolve and retry those once before surfacing the error.
+            warn!("Recorder open failed ({first_err}); re-resolving device and retrying once");
+            self.invalidate_device_cache();
+            resolution = self.resolve_microphone_device(&settings);
+
+            let second_open = self
+                .recorder
+                .lock()
+                .unwrap()
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("Recorder not available after recovery"))?
+                .open(resolution.device.clone());
+            if let Err(error) = second_open {
+                let replace = self
+                    .recorder
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(AudioRecorder::replacement_required);
+                if replace {
+                    let mut old = self.recorder.lock().unwrap().take();
+                    if let Some(recorder) = old.as_mut() {
+                        let _ = recorder.close();
+                    }
+                }
+                return Err(anyhow::anyhow!("Failed to open recorder: {}", error));
             }
         }
         debug!(
@@ -705,7 +939,6 @@ impl AudioRecordingManager {
             vad_elapsed,
             open_started.elapsed()
         );
-        drop(recorder_opt);
 
         *open_flag = true;
         if let Some(unavailable_name) = resolution.unavailable_selected_microphone {
@@ -739,15 +972,30 @@ impl AudioRecordingManager {
             mute_guard.did_mute = false;
         }
 
-        if let Some(rec) = self.recorder.lock().unwrap().as_mut() {
-            // If still recording, stop first.
-            if *self.is_recording.lock().unwrap() {
-                let _ = rec.stop();
-                *self.is_recording.lock().unwrap() = false;
+        {
+            let mut recorder_guard = self.recorder.lock().unwrap();
+            let replace = if let Some(recorder) = recorder_guard.as_mut() {
+                // If still recording, stop first.
+                let stop_failed = if *self.is_recording.lock().unwrap() {
+                    let failed = recorder.stop().is_err();
+                    *self.is_recording.lock().unwrap() = false;
+                    failed
+                } else {
+                    false
+                };
+                let close_failed = recorder.close().is_err();
+                stop_failed || close_failed || recorder.replacement_required()
+            } else {
+                false
+            };
+            if replace {
+                recorder_guard.take();
+                self.invalidate_device_cache();
             }
-            let _ = rec.close();
         }
 
+        self.accepted_callback_generation
+            .store(0, Ordering::Release);
         *open_flag = false;
         debug!("Microphone stream stopped");
     }
@@ -800,6 +1048,10 @@ impl AudioRecordingManager {
         let mut state = self.state.lock().unwrap();
 
         if let RecordingState::Idle = *state {
+            let generation = self.capture_generation.fetch_add(1, Ordering::AcqRel) + 1;
+            self.readiness_generation
+                .store(generation, Ordering::Release);
+
             // Cancel any pending lazy close (no-op in always-on mode, where
             // closes are never scheduled).
             self.close_generation.fetch_add(1, Ordering::SeqCst);
@@ -810,14 +1062,34 @@ impl AudioRecordingManager {
             // "Recorder not available".
             if let Err(e) = self.start_microphone_stream() {
                 let msg = format!("{e}");
-                error!("Failed to open microphone stream: {msg}");
+                self.accepted_callback_generation
+                    .store(0, Ordering::Release);
+                self.readiness_generation.store(0, Ordering::Release);
+                let error_type = if crate::audio_toolkit::is_microphone_access_denied(&msg) {
+                    "microphone_permission_denied"
+                } else if crate::audio_toolkit::is_no_input_device_error(&msg) {
+                    "no_input_device"
+                } else if msg.to_lowercase().contains("timed out") {
+                    MICROPHONE_STALLED_ERROR
+                } else {
+                    "unknown"
+                };
+                self.report_capture_failure(
+                    generation,
+                    "stream_initialization",
+                    error_type,
+                    Some(msg.clone()),
+                    &msg,
+                    true,
+                );
                 return Err(msg);
             }
 
+            self.accepted_callback_generation
+                .store(generation, Ordering::Release);
             if let Some(rec) = self.recorder.lock().unwrap().as_ref() {
-                match rec.start(vad_policy) {
+                match rec.start(vad_policy, generation) {
                     Ok(receiver) => {
-                        let generation = self.capture_generation.fetch_add(1, Ordering::AcqRel) + 1;
                         *self.is_recording.lock().unwrap() = true;
                         self.set_state(
                             &mut state,
@@ -826,15 +1098,42 @@ impl AudioRecordingManager {
                             },
                         );
                         debug!("Recording requested for binding {binding_id}");
-                        return Ok(RecordingReadiness {
+                        Ok(RecordingReadiness {
                             receiver,
                             generation,
-                        });
+                        })
                     }
-                    Err(error) => return Err(format!("Failed to start recorder: {error}")),
+                    Err(error) => {
+                        let message = format!("Failed to start recorder: {error}");
+                        self.accepted_callback_generation
+                            .store(0, Ordering::Release);
+                        self.readiness_generation.store(0, Ordering::Release);
+                        self.report_capture_failure(
+                            generation,
+                            "start_command",
+                            "unknown",
+                            Some(message.clone()),
+                            &message,
+                            true,
+                        );
+                        Err(message)
+                    }
                 }
+            } else {
+                let message = "Recorder not available".to_string();
+                self.accepted_callback_generation
+                    .store(0, Ordering::Release);
+                self.readiness_generation.store(0, Ordering::Release);
+                self.report_capture_failure(
+                    generation,
+                    "start_command",
+                    "unknown",
+                    Some(message.clone()),
+                    &message,
+                    true,
+                );
+                Err(message)
             }
-            Err("Recorder not available".to_string())
         } else {
             Err("Already recording".to_string())
         }
@@ -890,11 +1189,11 @@ impl AudioRecordingManager {
     /// Invalidate pending first-sample UI and audio-feedback work immediately.
     /// Called at the beginning of stop, before the slower capture drain starts.
     pub fn invalidate_recording_readiness(&self) {
-        self.capture_generation.fetch_add(1, Ordering::AcqRel);
+        self.readiness_generation.store(0, Ordering::Release);
     }
 
     pub fn is_recording_readiness_current(&self, generation: u64) -> bool {
-        self.capture_generation.load(Ordering::Acquire) == generation
+        self.readiness_generation.load(Ordering::Acquire) == generation
     }
 
     pub fn cancel_generation(&self) -> u64 {
@@ -906,6 +1205,7 @@ impl AudioRecordingManager {
     }
 
     pub fn stop_recording(&self, binding_id: &str, cancel_generation: u64) -> Option<Vec<f32>> {
+        let capture_generation = self.capture_generation.load(Ordering::Acquire);
         self.invalidate_recording_readiness();
         let mut state = self.state.lock().unwrap();
 
@@ -938,30 +1238,48 @@ impl AudioRecordingManager {
                     }
                 }
 
-                let samples = if let Some(rec) = self.recorder.lock().unwrap().as_ref() {
-                    match rec.stop() {
-                        Ok(buf) => buf,
-                        Err(e) => {
-                            error!("stop() failed: {e}");
-                            Vec::new()
-                        }
-                    }
+                let stop_result = if let Some(rec) = self.recorder.lock().unwrap().as_ref() {
+                    rec.stop()
                 } else {
-                    error!("Recorder not available");
-                    Vec::new()
+                    Err(Box::new(std::io::Error::other("Recorder not available"))
+                        as Box<dyn std::error::Error>)
                 };
 
+                self.accepted_callback_generation
+                    .store(0, Ordering::Release);
                 *self.is_recording.lock().unwrap() = false;
+                if let Err(error) = &stop_result {
+                    self.report_capture_failure(
+                        capture_generation,
+                        "stop_response_timeout",
+                        MICROPHONE_STALLED_ERROR,
+                        None,
+                        &error.to_string(),
+                        false,
+                    );
+                    self.quarantine_recorder(&error.to_string());
+                }
                 self.set_state(&mut self.state.lock().unwrap(), RecordingState::Idle);
 
-                // In on-demand mode, close the mic (lazily if the setting is enabled)
-                if matches!(*self.mode.lock().unwrap(), MicrophoneMode::OnDemand) {
+                // In on-demand mode, close the mic (lazily if the setting is enabled).
+                // An unresponsive recorder was already quarantined above.
+                if stop_result.is_ok()
+                    && matches!(*self.mode.lock().unwrap(), MicrophoneMode::OnDemand)
+                {
                     if get_settings(&self.app_handle).lazy_stream_close {
                         self.schedule_lazy_close();
                     } else {
                         self.stop_microphone_stream();
                     }
                 }
+
+                let samples = match stop_result {
+                    Ok(samples) => samples,
+                    Err(error) => {
+                        error!("stop() failed: {error}");
+                        return None;
+                    }
+                };
 
                 if self.was_cancelled_since(cancel_generation) {
                     debug!("Recording stop cancelled; discarding captured samples");
@@ -993,34 +1311,150 @@ impl AudioRecordingManager {
 
     /// Cancel any ongoing recording without returning audio samples
     pub fn cancel_recording(&self) {
+        let capture_generation = self.capture_generation.load(Ordering::Acquire);
         self.invalidate_recording_readiness();
         self.cancel_generation.fetch_add(1, Ordering::AcqRel);
         let mut state = self.state.lock().unwrap();
 
         match *state {
             RecordingState::Recording { .. } => {
-                self.set_state(&mut state, RecordingState::Idle);
+                // Keep starts excluded until bounded recorder teardown finishes;
+                // publishing Idle early would let a new recorder race with
+                // quarantine of the old generation.
+                self.set_state(&mut state, RecordingState::Stopping);
                 drop(state);
 
-                if let Some(rec) = self.recorder.lock().unwrap().as_ref() {
-                    let _ = rec.stop(); // Discard the result
-                }
-
+                // Cancellation discards the tail, so invalidate all downstream
+                // callbacks before asking the old worker to stop.
+                self.accepted_callback_generation
+                    .store(0, Ordering::Release);
+                let stop_result = self
+                    .recorder
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(AudioRecorder::stop);
                 *self.is_recording.lock().unwrap() = false;
 
-                // In on-demand mode, close the mic (lazily if the setting is enabled)
-                if matches!(*self.mode.lock().unwrap(), MicrophoneMode::OnDemand) {
+                let stop_failed = matches!(stop_result, Some(Err(_)));
+                if let Some(Err(error)) = stop_result {
+                    self.report_capture_failure(
+                        capture_generation,
+                        "cancel_stop_timeout",
+                        MICROPHONE_STALLED_ERROR,
+                        None,
+                        &error.to_string(),
+                        true,
+                    );
+                    self.quarantine_recorder(&error.to_string());
+                }
+
+                // In on-demand mode, close the mic (lazily if the setting is enabled).
+                if !stop_failed && matches!(*self.mode.lock().unwrap(), MicrophoneMode::OnDemand) {
                     if get_settings(&self.app_handle).lazy_stream_close {
                         self.schedule_lazy_close();
                     } else {
                         self.stop_microphone_stream();
                     }
                 }
+
+                self.set_state(&mut self.state.lock().unwrap(), RecordingState::Idle);
             }
             RecordingState::Stopping => {
                 debug!("Cancellation requested while recording is stopping");
             }
             RecordingState::Idle => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{accepts_capture_callback, claim_capture_generation};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    #[test]
+    fn stale_worker_frames_and_levels_are_rejected() {
+        let accepted = AtomicU64::new(12);
+
+        assert!(accepts_capture_callback(&accepted, 12));
+        assert!(!accepts_capture_callback(&accepted, 11));
+
+        // Quarantine clears the accepted generation before detaching.
+        accepted.store(0, Ordering::Release);
+        assert!(!accepts_capture_callback(&accepted, 12));
+    }
+
+    #[test]
+    fn capture_failure_claim_is_once_per_generation_and_rejects_stale_workers() {
+        let current = AtomicU64::new(4);
+        let active = AtomicBool::new(true);
+        let terminal_latch = AtomicU64::new(0);
+
+        assert!(claim_capture_generation(
+            &current,
+            &active,
+            &terminal_latch,
+            4,
+            false
+        ));
+        assert!(!claim_capture_generation(
+            &current,
+            &active,
+            &terminal_latch,
+            4,
+            false
+        ));
+
+        current.store(5, Ordering::Release);
+        assert!(!claim_capture_generation(
+            &current,
+            &active,
+            &terminal_latch,
+            4,
+            false
+        ));
+        assert!(claim_capture_generation(
+            &current,
+            &active,
+            &terminal_latch,
+            5,
+            false
+        ));
+    }
+
+    #[test]
+    fn warning_and_terminal_claims_do_not_suppress_each_other() {
+        let current = AtomicU64::new(9);
+        let active = AtomicBool::new(true);
+        let warning_latch = AtomicU64::new(0);
+        let terminal_latch = AtomicU64::new(0);
+
+        assert!(claim_capture_generation(
+            &current,
+            &active,
+            &warning_latch,
+            9,
+            false
+        ));
+        assert!(claim_capture_generation(
+            &current,
+            &active,
+            &terminal_latch,
+            9,
+            false
+        ));
+    }
+
+    #[test]
+    fn inactive_capture_is_claimable_only_for_synchronous_start_cleanup() {
+        let current = AtomicU64::new(2);
+        let active = AtomicBool::new(false);
+        let latch = AtomicU64::new(0);
+
+        assert!(!claim_capture_generation(
+            &current, &active, &latch, 2, false
+        ));
+        assert!(claim_capture_generation(&current, &active, &latch, 2, true));
     }
 }

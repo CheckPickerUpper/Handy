@@ -1,8 +1,9 @@
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::apple_intelligence;
 use crate::audio_feedback::{play_feedback_sound, play_feedback_sound_blocking, SoundType};
-use crate::audio_toolkit::{is_microphone_access_denied, is_no_input_device_error, VadPolicy};
-use crate::managers::audio::AudioRecordingManager;
+use crate::audio_toolkit::{VadPolicy, MICROPHONE_READY_TIMEOUT};
+use crate::capture_events::MICROPHONE_STALLED_ERROR;
+use crate::managers::audio::{AudioRecordingManager, RecordingReadinessResult};
 use crate::managers::history::HistoryManager;
 use crate::managers::model::ModelManager;
 use crate::managers::transcription::StreamWorkKind;
@@ -25,12 +26,6 @@ use tauri::Manager;
 use tauri::{AppHandle, Emitter};
 
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(25);
-
-#[derive(Clone, serde::Serialize)]
-struct RecordingErrorEvent {
-    error_type: String,
-    detail: Option<String>,
-}
 
 /// Drop guard that notifies the [`TranscriptionCoordinator`] when the
 /// transcription pipeline finishes — whether it completes normally or panics.
@@ -550,9 +545,39 @@ impl ShortcutAction for TranscribeAction {
                 let app_clone = app.clone();
                 let rm_clone = Arc::clone(&rm);
                 std::thread::spawn(move || {
-                    if !readiness.wait() {
-                        debug!("Microphone readiness wait ended without receiving samples");
-                        return;
+                    match readiness.wait() {
+                        RecordingReadinessResult::Ready => {}
+                        result => {
+                            if !rm_clone.is_recording_readiness_current(generation) {
+                                debug!("Microphone readiness wait ended for an inactive recording");
+                                return;
+                            }
+
+                            let (detector, detail) = match result {
+                                RecordingReadinessResult::Disconnected => (
+                                    "startup_callback_watchdog",
+                                    "The recorder stopped before its first sample arrived",
+                                ),
+                                RecordingReadinessResult::TimedOut => (
+                                    "readiness_timeout",
+                                    "The recorder consumer did not report readiness before the UI timeout",
+                                ),
+                                RecordingReadinessResult::Ready => unreachable!(),
+                            };
+                            warn!(
+                                "Microphone did not deliver samples within {:?}: {detail}",
+                                MICROPHONE_READY_TIMEOUT
+                            );
+                            rm_clone.report_capture_failure(
+                                generation,
+                                detector,
+                                MICROPHONE_STALLED_ERROR,
+                                None,
+                                detail,
+                                false,
+                            );
+                            return;
+                        }
                     }
 
                     // Development-only preview hook for evaluating the brief
@@ -599,28 +624,10 @@ impl ShortcutAction for TranscribeAction {
         if recording_error.is_none() {
             // Dynamically register the cancel shortcut in a separate task to avoid deadlock
             shortcut::register_cancel_shortcut(app);
-        } else {
-            // Starting failed (for example due to blocked microphone permissions).
-            // Revert UI state so we don't stay stuck in the recording overlay.
-            tm.cancel_stream();
-            utils::hide_recording_overlay(app);
-            set_tray_state(app, TrayIconState::Idle);
-            if let Some(err) = recording_error {
-                let error_type = if is_microphone_access_denied(&err) {
-                    "microphone_permission_denied"
-                } else if is_no_input_device_error(&err) {
-                    "no_input_device"
-                } else {
-                    "unknown"
-                };
-                let _ = app.emit(
-                    "recording-error",
-                    RecordingErrorEvent {
-                        error_type: error_type.to_string(),
-                        detail: Some(err),
-                    },
-                );
-            }
+        } else if let Some(error) = recording_error {
+            // The manager routes every start failure through the per-generation
+            // failure gate, which emits once and performs idempotent cleanup.
+            debug!("Recording start failure is being handled centrally: {error}");
         }
 
         debug!(

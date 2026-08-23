@@ -7,7 +7,11 @@ import {
   checkAccessibilityPermission,
   checkMicrophonePermission,
 } from "tauri-plugin-macos-permissions-api";
-import { ModelStateEvent, RecordingErrorEvent } from "./lib/types/events";
+import {
+  ModelStateEvent,
+  RecordingErrorEvent,
+  RecordingWarningEvent,
+} from "./lib/types/events";
 import "./App.css";
 import AccessibilityPermissions from "./components/AccessibilityPermissions";
 import SecureInputWarning from "./components/SecureInputWarning";
@@ -114,12 +118,34 @@ function App() {
         toast.error(t("errors.noInputDeviceTitle"), {
           description: t("errors.noInputDevice"),
         });
+      } else if (error_type === "microphone_stalled") {
+        toast.error(t("errors.microphoneStalledTitle"), {
+          description: t("errors.microphoneStalled"),
+        });
       } else {
         toast.error(
           t("errors.recordingFailed", { error: detail ?? "Unknown error" }),
         );
       }
     });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [t]);
+
+  // Audio loss is nonfatal: preserve the dictation but make the gap visible.
+  useEffect(() => {
+    const unlisten = listen<RecordingWarningEvent>(
+      "recording-warning",
+      (event) => {
+        if (event.payload.warning_type === "audio_dropped") {
+          toast.warning(t("errors.audioDroppedTitle"), {
+            description: t("errors.audioDropped"),
+            duration: 10000,
+          });
+        }
+      },
+    );
     return () => {
       unlisten.then((fn) => fn());
     };

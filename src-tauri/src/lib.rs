@@ -4,6 +4,7 @@ mod apple_intelligence;
 mod audio_feedback;
 pub mod audio_toolkit;
 mod autostart;
+mod capture_events;
 mod catalog;
 pub mod cli;
 mod clipboard;
