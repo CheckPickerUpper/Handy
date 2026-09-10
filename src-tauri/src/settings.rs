@@ -349,7 +349,7 @@ pub struct AppSettings {
     pub bindings: HashMap<String, ShortcutBinding>,
     #[serde(default = "default_push_to_talk")]
     pub push_to_talk: bool,
-    #[serde(default)]
+    #[serde(default = "default_audio_feedback")]
     pub audio_feedback: bool,
     #[serde(default = "default_audio_feedback_volume")]
     pub audio_feedback_volume: f32,
@@ -497,6 +497,10 @@ fn default_push_to_talk() -> bool {
     true
 }
 
+fn default_audio_feedback() -> bool {
+    true
+}
+
 fn default_always_on_microphone() -> bool {
     false
 }
@@ -589,7 +593,7 @@ fn default_audio_feedback_volume() -> f32 {
 }
 
 fn default_sound_theme() -> SoundTheme {
-    SoundTheme::Marimba
+    SoundTheme::Pop
 }
 
 fn default_theme() -> Theme {
@@ -878,7 +882,7 @@ pub fn get_default_settings() -> AppSettings {
         settings_schema_version: default_settings_schema_version(),
         bindings,
         push_to_talk: default_push_to_talk(),
-        audio_feedback: false,
+        audio_feedback: default_audio_feedback(),
         audio_feedback_volume: default_audio_feedback_volume(),
         sound_theme: default_sound_theme(),
         start_hidden: default_start_hidden(),
@@ -1186,7 +1190,7 @@ mod tests {
         let settings: AppSettings = serde_json::from_value(serde_json::json!({}))
             .expect("all AppSettings fields need serde defaults");
         assert!(settings.push_to_talk);
-        assert!(!settings.audio_feedback);
+        assert!(settings.audio_feedback);
         assert!(settings.filler_word_removal_enabled);
         // Bindings default to empty; the load path merges the real defaults in.
         assert!(settings.bindings.is_empty());

@@ -235,7 +235,7 @@
       },
       "audioFeedback": {
         "label": "Audio Feedback",
-        "description": "Play sound when recording starts and stops"
+        "description": "Play a short sound when listening starts and the transcription is ready"
       },
       "outputDevice": {
         "title": "Output Device",

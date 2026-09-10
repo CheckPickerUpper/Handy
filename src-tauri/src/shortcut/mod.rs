@@ -560,8 +560,8 @@ pub fn change_sound_theme_setting(app: AppHandle, theme: String) -> Result<(), S
         "pop" => SoundTheme::Pop,
         "custom" => SoundTheme::Custom,
         other => {
-            warn!("Invalid sound theme '{}', defaulting to marimba", other);
-            SoundTheme::Marimba
+            warn!("Invalid sound theme '{}', defaulting to pop", other);
+            SoundTheme::Pop
         }
     };
     settings.sound_theme = parsed;
