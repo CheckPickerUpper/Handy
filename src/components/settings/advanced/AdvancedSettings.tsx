@@ -62,6 +62,8 @@ export const AdvancedSettings: React.FC = () => {
         />
       </SettingsGroup>
 
+      <KeyboardBackendPermissions />
+
       {experimentalEnabled && (
         <SettingsGroup title={t("settings.advanced.groups.experimental")}>
           <PostProcessingToggle descriptionMode="tooltip" grouped={true} />
@@ -69,7 +71,6 @@ export const AdvancedSettings: React.FC = () => {
             descriptionMode="tooltip"
             grouped={true}
           />
-          <KeyboardBackendPermissions />
           <AccelerationSelector descriptionMode="tooltip" grouped={true} />
           <LazyStreamClose descriptionMode="tooltip" grouped={true} />
         </SettingsGroup>

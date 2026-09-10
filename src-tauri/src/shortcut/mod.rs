@@ -18,7 +18,6 @@ use serde::{Deserialize, Serialize};
 use specta::Type;
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager};
-use tauri_plugin_autostart::ManagerExt;
 use tauri_specta::Event;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -89,30 +88,55 @@ fn emit_backend_status(app: &AppHandle) {
     let _ = current_backend_status(app).emit(app);
 }
 
+fn is_wayland_shortcut_session() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        return crate::utils::is_wayland();
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
 /// Initialize shortcuts using the configured implementation
-pub fn init_shortcuts(app: &AppHandle) {
+pub fn init_shortcuts(app: &AppHandle) -> Result<(), String> {
     let user_settings = settings::load_or_create_app_settings(app);
+    let implementation = if is_wayland_shortcut_session()
+        && user_settings.keyboard_implementation == KeyboardImplementation::Tauri
+    {
+        // Tauri's Linux backend is X11-only. Persist the backend that can
+        // receive hardware events so an existing install follows the session
+        // it is launched in as well as a fresh install.
+        let mut migrated_settings = user_settings;
+        migrated_settings.keyboard_implementation = KeyboardImplementation::HandyKeys;
+        settings::write_settings(app, migrated_settings);
+        KeyboardImplementation::HandyKeys
+    } else {
+        user_settings.keyboard_implementation
+    };
 
     // Check which implementation to use
-    match user_settings.keyboard_implementation {
+    match implementation {
         KeyboardImplementation::Tauri => {
+            set_backend_failure(app, None);
             tauri_impl::init_shortcuts(app);
         }
         KeyboardImplementation::HandyKeys => {
             if let Err(e) = handy_keys::init_shortcuts(app) {
-                error!("Failed to initialize handy-keys shortcuts: {}", e);
-                // Fall back to Tauri implementation and persist this fallback
-                warn!("Falling back to Tauri global shortcut implementation and saving fallback to settings");
+                error!("Failed to initialize Handy Keys shortcuts: {}", e);
+                set_backend_failure(app, Some(e.clone()));
 
-                // Keep the failure around: the frontend shows it (with the
-                // fix the error message names) and offers a retry.
-                set_backend_failure(app, Some(e));
+                if is_wayland_shortcut_session() {
+                    emit_backend_status(app);
+                    return Err(format!("Failed to initialize Handy Keys on Wayland: {}", e));
+                }
 
-                // Update settings to persist the fallback so we don't retry HandyKeys on next launch
+                // Tauri remains the native X11 fallback when Handy Keys is
+                // unavailable on a session where that backend is supported.
+                warn!("Falling back to Tauri global shortcut implementation");
                 let mut settings = settings::get_settings(app);
                 settings.keyboard_implementation = KeyboardImplementation::Tauri;
                 settings::write_settings(app, settings);
-
                 tauri_impl::init_shortcuts(app);
             } else {
                 set_backend_failure(app, None);
@@ -121,6 +145,7 @@ pub fn init_shortcuts(app: &AppHandle) {
     }
 
     emit_backend_status(app);
+    Ok(())
 }
 
 /// Register the cancel shortcut (called when recording starts)
@@ -375,6 +400,13 @@ pub fn change_keyboard_implementation_setting(
     let current_impl = current_settings.keyboard_implementation;
     let new_impl = parse_keyboard_implementation(&implementation);
 
+    if new_impl == KeyboardImplementation::Tauri && is_wayland_shortcut_session() {
+        return Err(
+            "Tauri global shortcuts are unavailable on Wayland; use Handy Keys instead."
+                .to_string(),
+        );
+    }
+
     // If same implementation, nothing to do
     if current_impl == new_impl {
         return Ok(ImplementationChangeResult {
@@ -575,6 +607,12 @@ fn initialize_handy_keys_with_rollback(app: &AppHandle) -> Result<bool, String> 
     if let Err(e) = handy_keys::init_shortcuts(app) {
         error!("Failed to initialize HandyKeys: {}", e);
         set_backend_failure(app, Some(e.clone()));
+
+        if is_wayland_shortcut_session() {
+            emit_backend_status(app);
+            return Err(format!("Failed to initialize Handy Keys on Wayland: {}", e));
+        }
+
         // Rollback to Tauri
         let mut settings = settings::get_settings(app);
         settings.keyboard_implementation = KeyboardImplementation::Tauri;
@@ -617,12 +655,18 @@ pub fn retry_handy_keys_backend(app: AppHandle) -> Result<KeyboardBackendStatus,
         // detect-only, and a fresh construction picks up new permissions.
         if let Some(state) = app.try_state::<handy_keys::HandyKeysState>() {
             state.restart_manager()?;
+            if get_settings(&app).keyboard_implementation == KeyboardImplementation::HandyKeys {
+                // The restarted manager starts with no registrations
+                register_all_shortcuts_for_implementation(&app, KeyboardImplementation::HandyKeys);
+                return Ok(());
+            }
         }
 
         if get_settings(&app).keyboard_implementation == KeyboardImplementation::HandyKeys {
-            // The restarted manager starts with no registrations
-            register_all_shortcuts_for_implementation(&app, KeyboardImplementation::HandyKeys);
-            Ok(())
+            // The previous manager failed before it could be stored. Build it
+            // now so a retry checks the real backend rather than reporting a
+            // success with no listener behind it.
+            initialize_handy_keys_with_rollback(&app).map(|_| ())
         } else {
             // We previously fell back (and persisted) Tauri; switch back.
             // This re-runs handy-keys init with rollback on failure.

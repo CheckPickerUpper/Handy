@@ -192,7 +192,12 @@ pub enum KeyboardImplementation {
 impl Default for KeyboardImplementation {
     fn default() -> Self {
         #[cfg(target_os = "linux")]
-        return KeyboardImplementation::Tauri;
+        {
+            if crate::utils::is_wayland() {
+                return KeyboardImplementation::HandyKeys;
+            }
+            return KeyboardImplementation::Tauri;
+        }
         #[cfg(not(target_os = "linux"))]
         return KeyboardImplementation::HandyKeys;
     }
@@ -487,7 +492,7 @@ fn default_model() -> String {
     "".to_string()
 }
 
-const CURRENT_SETTINGS_SCHEMA_VERSION: u32 = 2;
+const CURRENT_SETTINGS_SCHEMA_VERSION: u32 = 3;
 
 fn default_settings_schema_version() -> u32 {
     CURRENT_SETTINGS_SCHEMA_VERSION
@@ -1109,6 +1114,20 @@ fn apply_settings_migrations(
         // transcribe.cpp 0.2 replaced integer registry indices with opaque
         // process-local handles. Clear every old index once.
         settings.transcribe_gpu_device = default_transcribe_gpu_device();
+        settings.settings_schema_version = CURRENT_SETTINGS_SCHEMA_VERSION;
+        updated = true;
+    }
+
+    if stored_schema_version < 3 {
+        // Tauri's Linux global-shortcut backend only receives X11 events. Keep
+        // existing Wayland installs on the evdev backend that can see the
+        // compositor's hardware events directly.
+        #[cfg(target_os = "linux")]
+        if crate::utils::is_wayland()
+            && settings.keyboard_implementation == KeyboardImplementation::Tauri
+        {
+            settings.keyboard_implementation = KeyboardImplementation::HandyKeys;
+        }
         settings.settings_schema_version = CURRENT_SETTINGS_SCHEMA_VERSION;
         updated = true;
     }

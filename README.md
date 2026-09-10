@@ -137,8 +137,12 @@ If you switch between a MacBook keyboard and an external one, pick a shortcut bu
 
 **Wayland Support (Linux):**
 
-- Limited support for Wayland display server
-- Requires [`wtype`](https://github.com/atx/wtype) or [`dotool`](https://sr.ht/~geb/dotool/) for text input to work correctly (see [Linux Notes](#linux-notes) below for installation)
+- Global shortcuts use Handy Keys on Wayland, so F-key and modifier shortcuts
+  are received directly from Linux input devices instead of relying on the
+  X11-only Tauri backend.
+- Text input still requires [`wtype`](https://github.com/atx/wtype) or
+  [`dotool`](https://sr.ht/~geb/dotool/) (see [Linux Notes](#linux-notes) below
+  for installation).
 
 ### Linux Notes
 
@@ -159,9 +163,9 @@ For reliable text input on Linux, install the appropriate tool for your display 
 
 Without these tools, Handy falls back to enigo which may have limited compatibility, especially on Wayland.
 
-**Handy Keys shortcut backend (experimental):**
+**Handy Keys shortcut backend (Linux):**
 
-The Handy Keys keyboard backend (Settings → Advanced → Experimental) reads keyboards directly from `/dev/input/event*` on Linux, which works identically on X11, Wayland, and the console. It needs two permissions:
+The Handy Keys keyboard backend reads keyboards directly from `/dev/input/event*` on Linux, which works identically on X11, Wayland, and the console. Handy selects it automatically on Wayland. It needs two permissions:
 
 - **Reading hotkeys (required):** read access to `/dev/input`. Add your user to the `input` group: `sudo usermod -aG input $USER` (then log out and back in).
 - **Blocking hotkeys (recommended):** write access to `/dev/uinput`, so registered shortcuts are swallowed instead of also reaching the focused application. The `.deb` and `.rpm` packages install a udev rule ([`contrib/udev/70-handy-keys.rules`](contrib/udev/70-handy-keys.rules)) that grants this automatically to the logged-in user. AppImage users (or anyone else) can install it manually — Handy shows the exact commands in a setup dialog when access is missing.
@@ -184,7 +188,10 @@ If `/dev/input` is readable but `/dev/uinput` is not, Handy degrades gracefully:
 - The recording overlay is disabled by default on Linux (`Overlay Position: None`) because certain compositors treat it as the active window. When the overlay is visible it can steal focus, which prevents Handy from pasting back into the application that triggered transcription. If you enable the overlay anyway, be aware that clipboard-based pasting might fail or end up in the wrong window.
 - If you are having trouble with the app, running with the environment variable `WEBKIT_DISABLE_DMABUF_RENDERER=1` may help
 - If Handy fails to start reliably on Linux, see [Troubleshooting → Linux Startup Crashes or Instability](#linux-startup-crashes-or-instability).
-- **Global keyboard shortcuts (Wayland):** On Wayland, system-level shortcuts must be configured through your desktop environment or window manager. Use the [CLI flags](#cli-parameters) as the command for your custom shortcut.
+- **Global keyboard shortcuts (Wayland):** Handy registers its configured
+  shortcuts through Handy Keys and reads the hardware events directly. If you
+  prefer compositor-managed shortcuts, use the [CLI flags](#cli-parameters)
+  as the command for your custom shortcut.
 
   **GNOME:**
   1. Open **Settings > Keyboard > Keyboard Shortcuts > Custom Shortcuts**
