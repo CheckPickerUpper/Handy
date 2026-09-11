@@ -682,6 +682,14 @@ pub fn hide_recording_overlay(app_handle: &AppHandle) {
     }
 }
 
+/// Hides the overlay synchronously before input is sent to the previous target.
+pub fn hide_recording_overlay_immediately(app_handle: &AppHandle) {
+    if let Some(overlay_window) = app_handle.get_webview_window("recording_overlay") {
+        let _ = overlay_window.emit("hide-overlay", ());
+        let _ = overlay_window.hide();
+    }
+}
+
 // Cached "overlay is enabled" flag, kept in sync with overlay_style. Avoids
 // reading the Tauri store on every audio callback (~24 Hz during recording).
 // Defaults to false so the audio path doesn't emit until lib.rs::setup

@@ -26,6 +26,11 @@
 # device: this grants the ability to synthesize input, not to observe it.
 KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
 
+# Mark Handy's Wayland paste injector as a keyboard so libinput-backed
+# compositors accept its synthesized Ctrl+V/Shift+Insert events. The virtual
+# device is intentionally short-lived and is created only for a paste action.
+KERNEL=="event*", ATTRS{name}=="handy-keys passthrough: Handy Wayland text input", ENV{ID_INPUT_KEYBOARD}="1"
+
 # --- Tier 2: zero-setup keyboard reading (disabled by default) ---------------
 # Uncommenting the rule below grants the seated user read access to all input
 # devices, so Handy can detect hotkeys without the user joining the 'input'

@@ -140,6 +140,10 @@ fn try_send_key_combo_linux(paste_method: &PasteMethod) -> Result<bool, String> 
             send_key_combo_via_ydotool(paste_method)?;
             return Ok(true);
         }
+
+        info!("Using Handy's uinput keyboard for key combo");
+        crate::uinput::send_paste_key_combo(paste_method)?;
+        return Ok(true);
     } else {
         // X11: prefer xdotool, then ydotool
         if is_xdotool_available() {
@@ -711,6 +715,19 @@ fn paste_direct(
         if try_direct_typing_linux(text, typing_tool)? {
             return Ok(());
         }
+        if is_wayland() {
+            info!("Using clipboard-backed paste because no native Wayland text tool is available");
+            let settings = get_settings(app_handle);
+            // Ctrl+Shift+V is the portable Wayland terminal chord and is also
+            // accepted by GTK and Chromium as plain-text paste.
+            return paste_via_clipboard(
+                text,
+                app_handle,
+                &PasteMethod::CtrlShiftV,
+                settings.paste_delay_ms,
+                settings.paste_delay_after_ms,
+            );
+        }
         info!("Falling back to enigo for direct text input");
     }
 
@@ -841,9 +858,7 @@ pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
 
     if should_send_auto_submit(settings.auto_submit, paste_method) {
         std::thread::sleep(Duration::from_millis(50));
-        if let Err(error) = with_enigo(&app_handle, |enigo| {
-            send_return_key(enigo, settings.auto_submit_key)
-        }) {
+        if let Err(error) = send_auto_submit_key(&app_handle, settings.auto_submit_key) {
             log::warn!("Paste succeeded, but auto-submit failed: {error}");
         }
     }
@@ -854,6 +869,18 @@ pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn send_auto_submit_key(
+    app_handle: &AppHandle,
+    auto_submit_key: AutoSubmitKey,
+) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    if is_wayland() {
+        return crate::uinput::send_auto_submit_key(auto_submit_key);
+    }
+
+    with_enigo(app_handle, |enigo| send_return_key(enigo, auto_submit_key))
 }
 
 #[cfg(test)]

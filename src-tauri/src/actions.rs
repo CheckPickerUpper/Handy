@@ -819,6 +819,10 @@ impl ShortcutAction for TranscribeAction {
                                         return;
                                     }
 
+                                    // The regular-window fallback can become the active target
+                                    // while its status card is visible. Hide it before injecting
+                                    // the paste chord so focus returns to the user's application.
+                                    utils::hide_recording_overlay_immediately(&ah_clone);
                                     match utils::paste(final_text, ah_clone.clone()) {
                                         Ok(()) => {
                                             debug!(
