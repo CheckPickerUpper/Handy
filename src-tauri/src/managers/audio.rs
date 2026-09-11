@@ -237,6 +237,7 @@ const WHISPER_SAMPLE_RATE: usize = 16000;
 #[derive(Clone, Debug)]
 pub enum RecordingState {
     Idle,
+    Starting { binding_id: String },
     Recording { binding_id: String },
     Stopping,
 }
@@ -786,7 +787,9 @@ impl AudioRecordingManager {
         self.recording_active.store(
             matches!(
                 *guard,
-                RecordingState::Recording { .. } | RecordingState::Stopping
+                RecordingState::Starting { .. }
+                    | RecordingState::Recording { .. }
+                    | RecordingState::Stopping
             ),
             Ordering::SeqCst,
         );
@@ -797,46 +800,80 @@ impl AudioRecordingManager {
         binding_id: &str,
         vad_policy: VadPolicy,
     ) -> Result<RecordingReadiness, String> {
+        // Reserve the lifecycle slot before doing cpal work, but do not hold
+        // this mutex across device enumeration or stream creation. Cancellation
+        // must be able to mark a slow start idle while the backend is waking up.
         let mut state = self.state.lock().unwrap();
+        if !matches!(&*state, RecordingState::Idle) {
+            return Err("Already recording".to_string());
+        }
+        self.set_state(
+            &mut state,
+            RecordingState::Starting {
+                binding_id: binding_id.to_string(),
+            },
+        );
+        drop(state);
 
-        if let RecordingState::Idle = *state {
-            // Cancel any pending lazy close (no-op in always-on mode, where
-            // closes are never scheduled).
-            self.close_generation.fetch_add(1, Ordering::SeqCst);
-            // Opens the stream in on-demand mode. In always-on mode the stream
-            // is normally already open and this is a cheap aliveness check —
-            // but if the capture worker died (device disconnect), it rebuilds
-            // the stream instead of leaving every subsequent start wedged on
-            // "Recorder not available".
-            if let Err(e) = self.start_microphone_stream() {
-                let msg = format!("{e}");
-                error!("Failed to open microphone stream: {msg}");
-                return Err(msg);
+        // Cancel any pending lazy close (no-op in always-on mode, where
+        // closes are never scheduled).
+        self.close_generation.fetch_add(1, Ordering::SeqCst);
+        // Opens the stream in on-demand mode. In always-on mode the stream
+        // is normally already open and this is a cheap aliveness check —
+        // but if the capture worker died (device disconnect), it rebuilds
+        // the stream instead of leaving every subsequent start wedged on
+        // "Recorder not available".
+        if let Err(e) = self.start_microphone_stream() {
+            let msg = format!("{e}");
+            error!("Failed to open microphone stream: {msg}");
+            let mut state = self.state.lock().unwrap();
+            if matches!(&*state, RecordingState::Starting { binding_id: active } if active == binding_id)
+            {
+                self.set_state(&mut state, RecordingState::Idle);
             }
+            return Err(msg);
+        }
 
-            if let Some(rec) = self.recorder.lock().unwrap().as_ref() {
-                match rec.start(vad_policy) {
-                    Ok(receiver) => {
-                        let generation = self.capture_generation.fetch_add(1, Ordering::AcqRel) + 1;
-                        *self.is_recording.lock().unwrap() = true;
-                        self.set_state(
-                            &mut state,
-                            RecordingState::Recording {
-                                binding_id: binding_id.to_string(),
-                            },
-                        );
-                        debug!("Recording requested for binding {binding_id}");
-                        return Ok(RecordingReadiness {
-                            receiver,
-                            generation,
-                        });
-                    }
-                    Err(error) => return Err(format!("Failed to start recorder: {error}")),
-                }
+        let mut state = self.state.lock().unwrap();
+        if !matches!(&*state, RecordingState::Starting { binding_id: active } if active == binding_id)
+        {
+            drop(state);
+            self.stop_microphone_stream();
+            return Err("Recording start cancelled".to_string());
+        }
+
+        let start_result = {
+            let recorder = self.recorder.lock().unwrap();
+            match recorder.as_ref() {
+                Some(rec) => rec
+                    .start(vad_policy)
+                    .map_err(|error| format!("Failed to start recorder: {error}")),
+                None => Err("Recorder not available".to_string()),
             }
-            Err("Recorder not available".to_string())
-        } else {
-            Err("Already recording".to_string())
+        };
+
+        match start_result {
+            Ok(receiver) => {
+                let generation = self.capture_generation.fetch_add(1, Ordering::AcqRel) + 1;
+                *self.is_recording.lock().unwrap() = true;
+                self.set_state(
+                    &mut state,
+                    RecordingState::Recording {
+                        binding_id: binding_id.to_string(),
+                    },
+                );
+                debug!("Recording requested for binding {binding_id}");
+                Ok(RecordingReadiness {
+                    receiver,
+                    generation,
+                })
+            }
+            Err(error) => {
+                self.set_state(&mut state, RecordingState::Idle);
+                drop(state);
+                self.stop_microphone_stream();
+                Err(error)
+            }
         }
     }
 
@@ -998,6 +1035,13 @@ impl AudioRecordingManager {
         let mut state = self.state.lock().unwrap();
 
         match *state {
+            RecordingState::Starting { .. } => {
+                // The start worker owns cleanup after a backend call returns.
+                // Marking idle here lets cancel return immediately even when
+                // the audio backend is slow.
+                debug!("Cancellation requested while microphone start is pending");
+                self.set_state(&mut state, RecordingState::Idle);
+            }
             RecordingState::Recording { .. } => {
                 self.set_state(&mut state, RecordingState::Idle);
                 drop(state);

@@ -19,6 +19,13 @@ use crate::audio_toolkit::{
     VoiceActivityDetector,
 };
 
+fn device_name(device: &cpal::Device) -> String {
+    device
+        .description()
+        .map(|description| description.name().to_string())
+        .unwrap_or_default()
+}
+
 enum Cmd {
     /// Begin capturing. Carries the send timestamp so the consumer can log how
     /// long the command sat in the channel, plus a one-shot acknowledgement
@@ -189,7 +196,7 @@ impl AudioRecorder {
             let stop_flag_for_stream = stop_flag.clone();
             let init_result = (|| -> Result<(cpal::Stream, u32), String> {
                 let config_started = Instant::now();
-                let device_name = thread_device.name().unwrap_or_default();
+                let device_name = device_name(&thread_device);
                 let cached_config = config_cache
                     .lock()
                     .unwrap()
@@ -204,12 +211,12 @@ impl AudioRecorder {
                 };
                 let config_elapsed = config_started.elapsed();
 
-                let sample_rate = config.sample_rate().0;
+                let sample_rate = config.sample_rate();
                 let channels = config.channels() as usize;
 
                 log::info!(
                     "Using device: {:?}\nSample rate: {}\nChannels: {}\nFormat: {:?}",
-                    thread_device.name(),
+                    device_name,
                     sample_rate,
                     channels,
                     config.sample_format()
@@ -419,7 +426,7 @@ impl AudioRecorder {
         selected_channel: Option<usize>,
         stop_flag: Arc<AtomicBool>,
         stream_error: Arc<AtomicBool>,
-    ) -> Result<cpal::Stream, cpal::BuildStreamError>
+    ) -> Result<cpal::Stream, Box<dyn std::error::Error>>
     where
         T: Sample + SizedSample + Send + 'static,
         f32: cpal::FromSample<T>,
@@ -477,15 +484,19 @@ impl AudioRecorder {
             }
         };
 
-        device.build_input_stream(
-            &config.clone().into(),
-            stream_cb,
-            move |err| {
-                log::error!("Stream error: {}", err);
-                stream_error.store(true, Ordering::Relaxed);
-            },
-            None,
-        )
+        let error_cb = move |err| {
+            log::error!("Stream error: {}", err);
+            stream_error.store(true, Ordering::Relaxed);
+        };
+
+        #[cfg(target_os = "linux")]
+        let stream = device.build_input_stream(config.clone().into(), stream_cb, error_cb, None)?;
+
+        #[cfg(not(target_os = "linux"))]
+        let stream =
+            device.build_input_stream(&config.clone().into(), stream_cb, error_cb, None)?;
+
+        Ok(stream)
     }
 
     pub fn preferred_input_channel_count(

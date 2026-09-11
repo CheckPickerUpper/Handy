@@ -1,11 +1,19 @@
 use crate::settings::SoundTheme;
 use crate::settings::{self, AppSettings};
+#[cfg(not(target_os = "linux"))]
 use cpal::traits::{DeviceTrait, HostTrait};
-use log::{debug, error, warn};
-use rodio::OutputStreamBuilder;
+use log::error;
+#[cfg(not(target_os = "linux"))]
+use log::{debug, warn};
+#[cfg(not(target_os = "linux"))]
+use rodio::DeviceSinkBuilder;
+#[cfg(not(target_os = "linux"))]
 use std::fs::File;
+#[cfg(not(target_os = "linux"))]
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::process::Command;
 use std::thread;
 use tauri::{AppHandle, Manager};
 
@@ -94,6 +102,31 @@ fn play_sound_at_path(app: &AppHandle, path: &Path) -> Result<(), Box<dyn std::e
     play_audio_file(path, selected_device, volume)
 }
 
+#[cfg(target_os = "linux")]
+fn play_audio_file(
+    path: &std::path::Path,
+    selected_device: Option<String>,
+    volume: f32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut command = Command::new("pw-play");
+    command
+        .arg("--volume")
+        .arg(volume.clamp(0.0, 1.0).to_string());
+    if let Some(device_name) = selected_device
+        .as_deref()
+        .filter(|device_name| *device_name != "Default")
+    {
+        command.arg("--target").arg(device_name);
+    }
+    let status = command.arg(path).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("pw-play exited with {status}").into())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
 fn play_audio_file(
     path: &std::path::Path,
     selected_device: Option<String>,
@@ -102,30 +135,30 @@ fn play_audio_file(
     let stream_builder = if let Some(device_name) = selected_device {
         if device_name == "Default" {
             debug!("Using default device");
-            OutputStreamBuilder::from_default_device()?
+            DeviceSinkBuilder::from_default_device()?
         } else {
             let host = crate::audio_toolkit::get_cpal_host();
             let devices = host.output_devices()?;
 
             let mut found_device = None;
             for device in devices {
-                if device.name()? == device_name {
+                if device.description()?.name() == device_name {
                     found_device = Some(device);
                     break;
                 }
             }
 
             match found_device {
-                Some(device) => OutputStreamBuilder::from_device(device)?,
+                Some(device) => DeviceSinkBuilder::from_device(device)?,
                 None => {
                     warn!("Device '{}' not found, using default device", device_name);
-                    OutputStreamBuilder::from_default_device()?
+                    DeviceSinkBuilder::from_default_device()?
                 }
             }
         }
     } else {
         debug!("Using default device");
-        OutputStreamBuilder::from_default_device()?
+        DeviceSinkBuilder::from_default_device()?
     };
 
     let stream_handle = stream_builder.open_stream()?;

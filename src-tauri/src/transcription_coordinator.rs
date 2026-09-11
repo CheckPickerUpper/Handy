@@ -34,12 +34,16 @@ enum Command {
     Cancel {
         recording_was_active: bool,
     },
+    StartFinished {
+        binding_id: String,
+    },
     ProcessingFinished,
 }
 
 /// Pipeline lifecycle, owned exclusively by the coordinator thread.
 enum Stage {
     Idle,
+    Starting(String),  // binding_id
     Recording(String), // binding_id
     Processing,
 }
@@ -82,6 +86,7 @@ pub fn is_transcribe_binding(id: &str) -> bool {
 impl TranscriptionCoordinator {
     pub fn new(app: AppHandle) -> Self {
         let (tx, rx) = mpsc::channel();
+        let start_sender = tx.clone();
 
         thread::spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -125,6 +130,17 @@ impl TranscriptionCoordinator {
                             is_pressed,
                             push_to_talk,
                         } => {
+                            if push_to_talk
+                                && !is_pressed
+                                && matches!(&stage, Stage::Starting(id) if id == &binding_id)
+                            {
+                                // Release must be able to cancel a backend that
+                                // is still opening the microphone.
+                                crate::utils::cancel_current_operation(&app);
+                                stage = Stage::Idle;
+                                continue;
+                            }
+
                             let pending_release_binding = pending_release
                                 .as_ref()
                                 .map(|pending| pending.binding_id.as_str());
@@ -168,7 +184,13 @@ impl TranscriptionCoordinator {
 
                             if push_to_talk {
                                 if is_pressed && matches!(stage, Stage::Idle) {
-                                    start(&app, &mut stage, &binding_id, &hotkey_string);
+                                    start(
+                                        &app,
+                                        &mut stage,
+                                        &binding_id,
+                                        &hotkey_string,
+                                        &start_sender,
+                                    );
                                 } else if !is_pressed
                                     && matches!(&stage, Stage::Recording(id) if id == &binding_id)
                                 {
@@ -177,7 +199,13 @@ impl TranscriptionCoordinator {
                             } else if is_pressed {
                                 match &stage {
                                     Stage::Idle => {
-                                        start(&app, &mut stage, &binding_id, &hotkey_string);
+                                        start(
+                                            &app,
+                                            &mut stage,
+                                            &binding_id,
+                                            &hotkey_string,
+                                            &start_sender,
+                                        );
                                     }
                                     Stage::Recording(id) if id == &binding_id => {
                                         stop(&app, &mut stage, &binding_id, &hotkey_string);
@@ -194,9 +222,22 @@ impl TranscriptionCoordinator {
                             pending_release = None;
                             // Don't reset during processing — wait for the pipeline to finish.
                             if !matches!(stage, Stage::Processing)
-                                && (recording_was_active || matches!(stage, Stage::Recording(_)))
+                                && (recording_was_active
+                                    || matches!(stage, Stage::Starting(_) | Stage::Recording(_)))
                             {
                                 stage = Stage::Idle;
+                            }
+                        }
+                        Command::StartFinished { binding_id } => {
+                            if matches!(&stage, Stage::Starting(id) if id == &binding_id) {
+                                if app
+                                    .try_state::<Arc<AudioRecordingManager>>()
+                                    .is_some_and(|audio| audio.is_recording())
+                                {
+                                    stage = Stage::Recording(binding_id);
+                                } else {
+                                    stage = Stage::Idle;
+                                }
                             }
                         }
                         Command::ProcessingFinished => {
@@ -256,20 +297,34 @@ impl TranscriptionCoordinator {
     }
 }
 
-fn start(app: &AppHandle, stage: &mut Stage, binding_id: &str, hotkey_string: &str) {
+fn start(
+    app: &AppHandle,
+    stage: &mut Stage,
+    binding_id: &str,
+    hotkey_string: &str,
+    coordinator: &Sender<Command>,
+) {
     let Some(action) = ACTION_MAP.get(binding_id) else {
         warn!("No action in ACTION_MAP for '{binding_id}'");
         return;
     };
-    action.start(app, binding_id, hotkey_string);
-    if app
-        .try_state::<Arc<AudioRecordingManager>>()
-        .is_some_and(|a| a.is_recording())
-    {
-        *stage = Stage::Recording(binding_id.to_string());
-    } else {
-        debug!("Start for '{binding_id}' did not begin recording; staying idle");
-    }
+
+    *stage = Stage::Starting(binding_id.to_string());
+    let action = Arc::clone(action);
+    let app = app.clone();
+    let binding_id = binding_id.to_string();
+    let hotkey_string = hotkey_string.to_string();
+    let coordinator = coordinator.clone();
+
+    thread::spawn(move || {
+        action.start(&app, &binding_id, &hotkey_string);
+        if coordinator
+            .send(Command::StartFinished { binding_id })
+            .is_err()
+        {
+            warn!("Transcription coordinator channel closed after start");
+        }
+    });
 }
 
 fn stop(app: &AppHandle, stage: &mut Stage, binding_id: &str, hotkey_string: &str) {
